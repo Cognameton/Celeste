@@ -90,6 +90,7 @@ memory:
   engram_auto_prune: true
   engram_retention_days: 30
   engram_keep_min_uses: 3
+  graph_enabled: true
 tts_presets:
   conversational: --length_scale 0.90 --noise_scale 0.60 --noise_w 0.90 --sentence_silence 0.14
   storyteller: --length_scale 1.05 --noise_scale 0.55 --noise_w 0.95 --sentence_silence 0.22

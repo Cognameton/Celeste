@@ -18,6 +18,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from config_types import AgentConfig
+from graph_memory import GraphMemory
 
 # Keep tokenizer threads quiet
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -326,6 +327,10 @@ class MemoryPipeline:
             retention_days=int(memory_cfg.get("engram_retention_days", DEFAULT_ENGRAM_RETENTION_DAYS)),
             keep_min_uses=int(memory_cfg.get("engram_keep_min_uses", DEFAULT_ENGRAM_KEEP_MIN_USES)),
         )
+        self.graph = GraphMemory(
+            os.path.join(self.cfg.data_dir, "memory_graph.sqlite3"),
+            enabled=bool(memory_cfg.get("graph_enabled", True)),
+        )
 
         # Ensure JSON store exists
         if not os.path.exists(self.json_path):
@@ -401,6 +406,7 @@ class MemoryPipeline:
         # Always log to JSON for transparency/audit
         self._append_json(text, kind, metadata)
         self.engram.add(text, kind=kind, metadata=metadata)
+        self.graph.observe_text(text, kind=kind, metadata=metadata)
 
         # Index selected kinds in vector DB
         if self.use_chroma and self.embedder is not None and self.collection is not None:
@@ -468,6 +474,15 @@ class MemoryPipeline:
 
     def search_engram(self, query: str, top_k: int = 5, kinds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         return self.engram.search(query, top_k=top_k, kinds=kinds)
+
+    def search_graph(
+        self,
+        query: str,
+        top_k: int = 4,
+        *,
+        evidence_texts: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        return self.graph.search(query, top_k=top_k, evidence_texts=evidence_texts)
 
     def purge_engram(self, seconds: int | None = None) -> dict[str, int | bool]:
         return self.engram.purge_recent(seconds=seconds)

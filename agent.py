@@ -1050,6 +1050,13 @@ class Agent:
             for hit in library_hits
             if (hit.get("text") or "").strip()
         ]
+        graph_evidence_texts = mem_texts + pattern_mem_texts + file_list + file_snippets + library_snippets
+        raw_graph_mems = self.mem.search_graph(
+            user,
+            top_k=max(1, min(self.cfg.top_k, 4)),
+            evidence_texts=graph_evidence_texts,
+        )
+        graph_mem_texts = [m["text"] for m in raw_graph_mems]
 
         filename_query = any(
             phrase in u_low for phrase in ("can you see", "do you see", "is there a file", "do you have a file", "how about")
@@ -1121,6 +1128,17 @@ class Agent:
             note_sections.append(recent_history)
         if kept_pattern_snippets:
             note_sections.append("Pattern Memory:\n" + "\n".join(f"- {s}" for s in kept_pattern_snippets))
+        kept_graph_snippets = self._truncate_for_budget(
+            [
+                text
+                for text in self._dedupe_texts(graph_mem_texts)
+                if text not in kept_pattern_snippets and text not in kept_snippets
+            ],
+            token_budget=max(24, int(self.cfg.n_ctx * (0.05 if broad_library_summary else 0.08))),
+            per_snippet_chars=180,
+        )
+        if kept_graph_snippets:
+            note_sections.append("Relational Memory:\n" + "\n".join(f"- {s}" for s in kept_graph_snippets))
         if kept_snippets:
             note_sections.append("Notes:\n" + "\n".join(f"- {s}" for s in kept_snippets))
         if grounding_note and not broad_library_summary:
