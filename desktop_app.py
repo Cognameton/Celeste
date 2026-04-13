@@ -33,7 +33,6 @@ try:
         QProgressBar,
         QProgressDialog,
         QScrollArea,
-        QSpacerItem,
         QSpinBox,
         QTextBrowser,
         QVBoxLayout,
@@ -641,7 +640,9 @@ class CelesteWindow(QMainWindow):
         self.model_combo.setInsertPolicy(QComboBox.NoInsert)
         self.model_combo.setMinimumHeight(32)
         form.addRow("LLM Model", self.model_combo)
-        form.addItem(QSpacerItem(0, 6), 0, 0)
+        _spacer = QWidget()
+        _spacer.setFixedHeight(6)
+        form.addRow(_spacer)
 
         self.tts_toggle = QCheckBox("Enable Piper speech")
         form.addRow("Speech", self.tts_toggle)
