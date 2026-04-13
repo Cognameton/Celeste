@@ -13,7 +13,7 @@ from collections import deque
 
 try:
     from PySide6.QtCore import QObject, QMetaObject, QThread, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QFont, QIcon, QTextCursor
+    from PySide6.QtGui import QFont, QIcon, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -25,7 +25,6 @@ try:
         QGridLayout,
         QHBoxLayout,
         QLabel,
-        QLineEdit,
         QListWidget,
         QMainWindow,
         QMessageBox,
@@ -890,7 +889,6 @@ class CelesteWindow(QMainWindow):
         layout.setStretch(0, 0)
         layout.setStretch(1, 1)
         self.setCentralWidget(root)
-        self._build_menu()
 
         self.deep_index_dialog = QProgressDialog("Building deep library index...", "Force Shutdown", 0, 100, self)
         self.deep_index_dialog.setWindowTitle("Building Deep Index")
@@ -991,152 +989,6 @@ class CelesteWindow(QMainWindow):
         }
             """
         )
-
-    def _build_menu(self) -> None:
-        menu_bar = self.menuBar()
-        settings_menu = menu_bar.addMenu("Settings")
-
-        general_action = QAction("General", self)
-        general_action.setStatusTip("Show the main settings panel")
-        general_action.triggered.connect(self._open_general)
-        settings_menu.addAction(general_action)
-
-        advanced_action = QAction("Advanced", self)
-        advanced_action.setStatusTip("GPU, llama-server, and context settings")
-        advanced_action.triggered.connect(self._open_advanced)
-        settings_menu.addAction(advanced_action)
-
-        settings_menu.addSeparator()
-
-        about_action = QAction("About Celeste", self)
-        about_action.triggered.connect(self._open_about)
-        settings_menu.addAction(about_action)
-
-    def _open_general(self) -> None:
-        # Settings panel is always visible in the Control Dock on the left
-        self.activateWindow()
-        self.raise_()
-
-    def _open_advanced(self) -> None:
-        cfg = self.cfg
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Advanced Settings")
-        dialog.resize(540, 320)
-        layout = QVBoxLayout(dialog)
-        layout.setSpacing(12)
-        layout.setContentsMargins(18, 18, 18, 18)
-
-        form = QFormLayout()
-        form.setVerticalSpacing(10)
-        form.setHorizontalSpacing(12)
-
-        # llama-server executable
-        llama_row = QWidget()
-        llama_layout = QHBoxLayout(llama_row)
-        llama_layout.setContentsMargins(0, 0, 0, 0)
-        llama_layout.setSpacing(6)
-        llama_edit = QLineEdit(str(getattr(cfg, "llama_server_executable", "") or ""))
-        llama_edit.setPlaceholderText("(use bundled llama-server)")
-        llama_layout.addWidget(llama_edit, 1)
-        llama_browse = QPushButton("Browse…")
-        llama_browse.setFixedWidth(80)
-        llama_browse.clicked.connect(lambda: _browse_file(llama_edit, "llama-server Executable"))
-        llama_layout.addWidget(llama_browse)
-        form.addRow("llama-server", llama_row)
-
-        # GPU layers
-        gpu_spin = QSpinBox()
-        gpu_spin.setRange(0, 999)
-        gpu_spin.setValue(int(getattr(cfg, "n_gpu_layers", 0) or 0))
-        gpu_spin.setSpecialValueText("0 — CPU only")
-        gpu_spin.setToolTip("Number of model layers to offload to GPU. Set to a high value (e.g. 999) to offload all layers.")
-        form.addRow("GPU Layers", gpu_spin)
-
-        # Context window
-        ctx_spin = QSpinBox()
-        ctx_spin.setRange(512, 131072)
-        ctx_spin.setSingleStep(512)
-        ctx_spin.setValue(int(getattr(cfg, "n_ctx", 4096) or 4096))
-        form.addRow("Context Window", ctx_spin)
-
-        # Threads
-        threads_spin = QSpinBox()
-        threads_spin.setRange(1, 64)
-        threads_spin.setValue(int(getattr(cfg, "n_threads", 8) or 8))
-        form.addRow("CPU Threads", threads_spin)
-
-        # Flash attention
-        flash_toggle = QCheckBox("Enable Flash Attention")
-        flash_toggle.setChecked(bool(getattr(cfg, "flash_attn", False)))
-        form.addRow("Flash Attn", flash_toggle)
-
-        layout.addLayout(form)
-
-        hint = QLabel("Changes take effect after Apply and Reload in the main settings panel.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #8da2b5; font-size: 11px;")
-        layout.addWidget(hint)
-
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        cancel_btn = QPushButton("Cancel")
-        btn_row.addStretch(1)
-        btn_row.addWidget(save_btn)
-        btn_row.addWidget(cancel_btn)
-        layout.addLayout(btn_row)
-
-        cancel_btn.clicked.connect(dialog.reject)
-
-        def _browse_file(target: QLineEdit, title: str) -> None:
-            path, _ = QFileDialog.getOpenFileName(dialog, title, target.text().strip() or "")
-            if path:
-                target.setText(path)
-
-        def _save() -> None:
-            overrides = {
-                "llama_server_executable": llama_edit.text().strip() or None,
-                "n_gpu_layers": gpu_spin.value(),
-                "n_ctx": ctx_spin.value(),
-                "n_threads": threads_spin.value(),
-                "flash_attn": flash_toggle.isChecked(),
-            }
-            self._set_busy(True, "Applying advanced settings...")
-            self.reload_requested.emit(overrides, True)
-            dialog.accept()
-
-        save_btn.clicked.connect(_save)
-        dialog.exec()
-
-    def _open_about(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("About Celeste")
-        dialog.resize(400, 260)
-        layout = QVBoxLayout(dialog)
-        layout.setSpacing(10)
-        layout.setContentsMargins(24, 24, 24, 24)
-        title = QLabel("Celeste")
-        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #a8ffcf;")
-        layout.addWidget(title)
-        version = QLabel("Version 0.1.0")
-        version.setStyleSheet("color: #8da2b5;")
-        layout.addWidget(version)
-        publisher = QLabel("Cognameton  ·  Everyman AI Lab")
-        publisher.setStyleSheet("color: #8da2b5;")
-        layout.addWidget(publisher)
-        layout.addSpacing(8)
-        desc = QLabel(
-            "A local-first desktop AI assistant with persistent memory, "
-            "semantic document retrieval, graph-based relational knowledge, "
-            "and streaming output — running fully offline on your hardware."
-        )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #d6e8f7;")
-        layout.addWidget(desc)
-        layout.addStretch(1)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignRight)
-        dialog.exec()
 
     def _build_worker(self) -> None:
         self.worker_thread = QThread(self)
