@@ -48,8 +48,19 @@ def _template_path() -> str:
 
 
 def _default_paths() -> dict[str, str]:
-    home = os.path.expanduser("~")
-    celeste_home = os.path.join(home, "Celeste")
+    # Packaged app: use %LOCALAPPDATA%\Celeste on Windows, ~/.config/Celeste on Linux
+    # Dev mode: use ~/Celeste as a sensible default outside the repo
+    if getattr(sys, "frozen", False):
+        if os.name == "nt":
+            celeste_home = os.path.join(
+                os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Celeste"
+            )
+        else:
+            base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+            celeste_home = os.path.join(base, "Celeste")
+    else:
+        celeste_home = os.path.join(os.path.expanduser("~"), "Celeste")
+
     bundled_model = _bundled_default_model_path()
     bundled_embedding = _bundled_default_embedding_dir()
     bundled_llama = _bundled_llama_server_path()
