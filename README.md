@@ -1,65 +1,99 @@
 # Celeste
 
-Celeste is a local-first desktop AI assistant with:
+A fully local, privacy-first desktop AI assistant. Celeste runs entirely on your own hardware — no cloud, no subscriptions, no data leaving your machine.
 
-- interchangeable local LLM backends
-- vector memory
-- reflection/playbook updates
-- file RAG with hybrid lexical + semantic retrieval
-- optional Piper TTS
+---
 
-## Requirements
+## Runs Completely Offline
 
-- Python 3.11+
-- a local GGUF model
-- optional CUDA for faster inference/embeddings
-- optional Piper for local TTS
+Every inference, embedding, and memory operation happens locally. Internet access is never required after setup.
 
-## Setup
+- Powered by [llama.cpp](https://github.com/ggerganov/llama.cpp) via `llama_cpp` Python bindings or an embedded `llama-server` process
+- Supports any GGUF-format model (Mistral, LLaMA, Qwen, DeepSeek, Phi, and others)
+- CUDA GPU offloading configurable per layer (`n_gpu_layers`); falls back to CPU transparently
+- Three selectable backends: `llama_cpp` (in-process), `llama_server` (subprocess), `transformers` (HuggingFace)
 
-### Manual developer setup
+---
 
-1. Create and activate a virtual environment.
-2. Install dependencies:
+## Remembers Who You Are
 
-```bash
-pip install -r requirements.txt
-```
+Celeste builds a persistent picture of the user across sessions and uses it to ground every response.
 
-3. Create a local config:
+- **Episodic memory** — conversation turns stored and retrieved from a local [Chroma](https://www.trychroma.com/) vector database using sentence-transformers embeddings
+- **Graph memory** — SQLite-backed fact graph (subject → predicate → object) populated at startup with runtime and library facts; injected into the system prompt as structured context
+- **Behavioral playbook** — persistent rules updated after every session via an async background reflection pass; loaded into the system preamble on next launch
+- Memory and graph writes run in background threads to avoid blocking startup
 
-```bash
-cp config.example.yaml config.yaml
-```
+---
 
-4. Edit `config.yaml` with your local model, embedding, data, and TTS paths.
+## Knows Your Documents
 
-5. Launch the desktop app:
+Point Celeste at any folder of local files and it retrieves relevant content before answering.
 
-```bash
-python desktop_app.py
-```
+- **Hybrid retrieval** — TF-IDF lexical index (always available, zero-latency) combined with a semantic deep index (sentence-transformer embeddings, built on demand)
+- Deep index supports multi-GPU encoding (`file_rag_multi_gpu`) for large libraries
+- Deep index is lazy-loaded and pre-warmed in a background thread at startup so the first query is fast
+- Per-directory file counts exposed in the settings UI
 
-If `config.yaml` does not exist, Celeste now opens a first-run setup wizard before launching.
+---
 
-### Bootstrap scripts
+## Speaks Back (Optional)
 
-Fresh Linux install:
+Local text-to-speech using [Piper](https://github.com/rhasspy/piper) with selectable voice models.
 
-```bash
-./scripts/bootstrap_linux.sh
-```
+- Piper executable and voice model paths configurable from the settings panel
+- Voice model browser built into the UI
+- TTS is opt-in and adds zero latency when disabled
 
-Fresh Windows install from PowerShell:
+---
 
-```powershell
-.\scripts\bootstrap_windows.ps1
-```
+## Fully Configurable from the UI
 
-These scripts create `.venv`, install Python dependencies, build `vendor/llama.cpp` if no `llama-server` is available, run the setup wizard when `config.yaml` is missing, validate the environment, and then launch Celeste.
+No config file editing required for day-to-day use.
 
-## Notes
+- Settings panel covers model selection, context window, GPU layers, embedding model, document directories, TTS, and persona
+- First-run setup wizard auto-detects bundled models, embeddings, llama-server, and Piper executables
+- Token usage progress bar color-coded green/amber/red; warns when context window approaches capacity
+- Persona editor modal for customizing the system preamble
+- Conversation export to plain text
 
-- Models are not included in this repository.
-- `config.yaml` is intentionally gitignored because it is machine-specific.
-- Build the deep index from the UI after configuring your document directories if you want semantic file retrieval.
+---
+
+## Streams Responses Live
+
+Tokens appear as they are generated — no waiting for the full response.
+
+- `Agent.respond()` accepts an optional `token_cb` callback; `model_runner.py` yields tokens via `stream=True`
+- Live preview rendered in a `QPlainTextEdit` frame that hides on completion
+- Markdown rendered to HTML inline (bold, italic, headers, inline code, bullet lists)
+
+---
+
+## Cross-Platform
+
+- **Windows** — PyInstaller bundle + Inno Setup installer (`Celeste-Setup-0.1.0.exe`)
+- **Linux** — PyInstaller bundle + `.tar.gz` + AppImage
+- Platform-aware config paths: `%LOCALAPPDATA%\Celeste` on Windows, `~/.config/Celeste` on Linux when packaged
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| GUI | Python, PySide6 (Qt6) |
+| Inference | llama.cpp, llama_cpp Python bindings |
+| Embeddings | sentence-transformers, PyTorch |
+| Vector memory | Chroma |
+| Graph memory | SQLite |
+| Lexical retrieval | scikit-learn TF-IDF |
+| TTS | Piper |
+| Config | Pydantic, PyYAML |
+| Packaging | PyInstaller, Inno Setup, AppImageTool |
+
+---
+
+## License
+
+Copyright (c) 2025 Jeremy Findley. All rights reserved.
+Source code is available for viewing and evaluation only. See [LICENSE](LICENSE).
