@@ -7,21 +7,6 @@ from PyInstaller.utils.hooks import collect_all
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parents[1]
 
-# Packages whose collected files we strip from the bundle entirely.
-# nvidia-* packages ship ~4 GB of CUDA runtime; triton ships ~640 MB.
-# llama-server handles GPU inference out-of-process and brings its own CUDA
-# libraries, so the app itself does not need them at runtime.
-_STRIP_PREFIXES = ("nvidia", "triton")
-
-def _is_stripped(path: str) -> bool:
-    parts = Path(path).parts
-    return any(
-        part.lower() == prefix or part.lower().startswith(prefix + "_")
-        for part in parts
-        for prefix in _STRIP_PREFIXES
-    )
-
-
 datas = [
     (str(PROJECT_ROOT / "config.example.yaml"), "."),
     (str(PROJECT_ROOT / "assets" / "celeste_icon.png"), "assets"),
@@ -43,10 +28,6 @@ for package in (
     binaries += package_binaries
     hiddenimports += package_hidden
 
-# Strip nvidia and triton bloat from collected files
-datas = [(src, dst) for src, dst in datas if not _is_stripped(src)]
-binaries = [(src, dst) for src, dst in binaries if not _is_stripped(src)]
-
 
 a = Analysis(
     [str(PROJECT_ROOT / "desktop_app.py")],
@@ -57,46 +38,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        "llama_cpp",
-        "triton",
-        # All nvidia CUDA runtime packages pulled in transitively by torch.
-        # llama-server ships its own CUDA runtime; the app itself doesn't need these.
-        "nvidia",
-        "nvidia.cublas",
-        "nvidia.cuda_cupti",
-        "nvidia.cuda_nvrtc",
-        "nvidia.cuda_runtime",
-        "nvidia.cudnn",
-        "nvidia.cufft",
-        "nvidia.cufile",
-        "nvidia.curand",
-        "nvidia.cusolver",
-        "nvidia.cusparse",
-        "nvidia.cusparselt",
-        "nvidia.nccl",
-        "nvidia.nvjitlink",
-        "nvidia.nvshmem",
-        "nvidia.nvtx",
-    ],
+    excludes=["llama_cpp"],
     noarchive=False,
     optimize=0,
 )
-
-# Post-analysis strip: remove nvidia and triton files collected by built-in hooks.
-# The excludes[] list only prevents Python module import graph traversal; binary
-# collection hooks fire regardless.  Filtering a.binaries / a.datas here is the
-# only reliable way to keep them out of the bundle.
-a.binaries = TOC([
-    (name, src, typ)
-    for name, src, typ in a.binaries
-    if not _is_stripped(name) and not _is_stripped(src or "")
-])
-a.datas = TOC([
-    (name, src, typ)
-    for name, src, typ in a.datas
-    if not _is_stripped(name) and not _is_stripped(src or "")
-])
 
 pyz = PYZ(a.pure)
 
