@@ -12,19 +12,11 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements-build.txt
 
-LLAMA_BIN_DIR="$PROJECT_ROOT/vendor/llama.cpp/build/bin"
-LLAMA_SERVER="$LLAMA_BIN_DIR/llama-server"
-if [ ! -x "$LLAMA_SERVER" ]; then
-  echo "Missing $LLAMA_SERVER. Build llama.cpp first, then rerun this packager." >&2
-  exit 1
-fi
-
 rm -rf "$PROJECT_ROOT/dist/Celeste" "$PROJECT_ROOT/build/Celeste"
 python -m PyInstaller packaging/pyinstaller/celeste.spec --noconfirm --clean
 
-mkdir -p "$PROJECT_ROOT/dist/Celeste/vendor/llama.cpp/build/bin"
-cp -a "$LLAMA_BIN_DIR/." "$PROJECT_ROOT/dist/Celeste/vendor/llama.cpp/build/bin/"
-chmod +x "$PROJECT_ROOT/dist/Celeste/vendor/llama.cpp/build/bin/llama-server"
+# llama-server is NOT bundled — Celeste detects hardware and installs the
+# correct pre-built (or compiles from source) on first launch via llama_installer.py.
 
 if [ -d "$PROJECT_ROOT/models" ]; then
   cp -a "$PROJECT_ROOT/models" "$PROJECT_ROOT/dist/Celeste/models"

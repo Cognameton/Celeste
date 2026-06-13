@@ -1,6 +1,6 @@
 # model_runner.py — llama.cpp runtime with adaptive kwargs filtering
 from typing import Optional, List, Any, Dict, Iterator, Callable
-from app_paths import runtime_root
+from app_paths import runtime_root, installed_llama_server_path, llama_install_dir
 from config_types import AgentConfig
 import atexit
 import inspect
@@ -25,15 +25,18 @@ PROJECT_ROOT = runtime_root()
 HOME_DIR = os.path.expanduser("~")
 _FLASH_ATTN_MODE_CACHE: dict[str, str] = {}
 _LLAMA_CPP_LIB_CANDIDATES = [
+    os.path.join(llama_install_dir(), "libllama.so"),
     os.path.join(PROJECT_ROOT, "vendor", "llama.cpp", "build", "bin", "libllama.so"),
     os.path.join(PROJECT_ROOT, "vendor", "llama.cpp", "build", "src", "libllama.so"),
     "/home/head-node/Dev/ai-lab/llama.cpp/build/bin/libllama.so",
     "/home/head-node/ai-lab/llama.cpp/build/bin/libllama.so",
 ]
 _LLAMA_CPP_BIN_DIR_CANDIDATES = [
-    os.path.dirname(path) for path in _LLAMA_CPP_LIB_CANDIDATES
+    llama_install_dir(),
+    *[os.path.dirname(path) for path in _LLAMA_CPP_LIB_CANDIDATES[1:]],
 ]
 _LLAMA_SERVER_CANDIDATES = [
+    installed_llama_server_path(),
     os.path.join(PROJECT_ROOT, "vendor", "llama.cpp", "build", "bin", "llama-server"),
     os.path.join(PROJECT_ROOT, "vendor", "llama.cpp", "build", "bin", "Release", "llama-server.exe"),
     os.path.join(PROJECT_ROOT, "vendor", "llama.cpp", "build", "bin", "llama-server.exe"),

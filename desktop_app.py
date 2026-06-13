@@ -5,6 +5,7 @@ import html
 import logging
 import multiprocessing as mp
 import os
+import platform
 import re
 import sys
 import threading
@@ -1663,6 +1664,18 @@ def main() -> int:
 
         if not ensure_config_with_wizard(config_path, app=app):
             return 0
+
+    if platform.system() == "Linux":
+        from app_config import load_config
+        from model_runner import resolve_llama_server_executable
+        from llama_installer import run_installer_dialog
+
+        cfg = load_config(config_path)
+        if (cfg.backend or "").lower().strip() == "llama_server" and \
+                resolve_llama_server_executable(cfg) is None:
+            if not run_installer_dialog(app=app):
+                return 0
+
     window = CelesteWindow(config_path)
     window.show()
     return app.exec()

@@ -21,6 +21,15 @@ def resource_path(*parts: str) -> str:
     return os.path.join(resource_root(), *parts)
 
 
+def llama_install_dir() -> str:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "Celeste", "llama")
+
+
+def installed_llama_server_path() -> str:
+    return os.path.join(llama_install_dir(), "llama-server")
+
+
 def default_config_path() -> str:
     if not getattr(sys, "frozen", False):
         return os.path.join(runtime_root(), "config.yaml")
