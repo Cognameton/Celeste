@@ -7,6 +7,21 @@ from PyInstaller.utils.hooks import collect_all
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parents[1]
 
+# Packages whose collected files we strip from the bundle entirely.
+# nvidia-* packages ship ~4 GB of CUDA runtime; triton ships ~640 MB.
+# llama-server handles GPU inference out-of-process and brings its own CUDA
+# libraries, so the app itself does not need them at runtime.
+_STRIP_PREFIXES = ("nvidia", "triton")
+
+def _is_stripped(path: str) -> bool:
+    parts = Path(path).parts
+    return any(
+        part.lower() == prefix or part.lower().startswith(prefix + "_")
+        for part in parts
+        for prefix in _STRIP_PREFIXES
+    )
+
+
 datas = [
     (str(PROJECT_ROOT / "config.example.yaml"), "."),
     (str(PROJECT_ROOT / "assets" / "celeste_icon.png"), "assets"),
@@ -28,6 +43,10 @@ for package in (
     binaries += package_binaries
     hiddenimports += package_hidden
 
+# Strip nvidia and triton bloat from collected files
+datas = [(src, dst) for src, dst in datas if not _is_stripped(src)]
+binaries = [(src, dst) for src, dst in binaries if not _is_stripped(src)]
+
 
 a = Analysis(
     [str(PROJECT_ROOT / "desktop_app.py")],
@@ -38,7 +57,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["llama_cpp"],
+    excludes=["llama_cpp", "nvidia", "triton"],
     noarchive=False,
     optimize=0,
 )
