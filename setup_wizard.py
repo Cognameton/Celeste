@@ -90,6 +90,30 @@ class EngineSetupWidget(QFrame):
         hw_label.setWordWrap(True)
         layout.addWidget(hw_label)
 
+        # AMD beta notice — AMD support is implemented but untested on real hardware
+        amd_gpus = [g for g in hw.gpus if g.vendor == "amd"]
+        if amd_gpus:
+            beta_frame = QFrame()
+            beta_frame.setFrameShape(QFrame.StyledPanel)
+            beta_frame.setStyleSheet(
+                "QFrame { background: #2a1f00; border: 1px solid #c8821a; border-radius: 4px; }"
+            )
+            beta_layout = QVBoxLayout(beta_frame)
+            beta_layout.setContentsMargins(10, 8, 10, 8)
+            beta_label = QLabel(
+                "<b>AMD GPU — Beta</b><br>"
+                "AMD support is implemented but has not yet been tested on real hardware. "
+                "Your setup will proceed automatically. If you run into issues — or if it "
+                "works perfectly — please let us know at "
+                "<a href='https://github.com/Cognameton/Celeste/issues'>"
+                "github.com/Cognameton/Celeste/issues</a>. "
+                "Your feedback directly shapes AMD support."
+            )
+            beta_label.setWordWrap(True)
+            beta_label.setOpenExternalLinks(True)
+            beta_layout.addWidget(beta_label)
+            layout.addWidget(beta_frame)
+
         if self._n_gpu_layers > 0:
             if self._tensor_split is not None:
                 n = len(self._tensor_split.split(","))
