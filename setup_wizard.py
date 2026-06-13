@@ -78,13 +78,30 @@ class EngineSetupWidget(QFrame):
         title = QLabel("<b>Step 1 — Setting up the AI Engine</b>")
         layout.addWidget(title)
 
-        from llama_installer import detect_hardware, fetch_release_assets, select_best_asset
+        from llama_installer import (
+            detect_hardware, fetch_release_assets, select_best_asset,
+            check_build_deps, compute_gpu_config,
+        )
         hw = detect_hardware()
         self._hw = hw
+        self._n_gpu_layers, self._tensor_split = compute_gpu_config(hw)
 
         hw_label = QLabel(f"Detected: {hw.describe()}")
         hw_label.setWordWrap(True)
         layout.addWidget(hw_label)
+
+        if self._n_gpu_layers > 0:
+            nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
+            amd = [g for g in hw.gpus if g.vendor == "amd"]
+            if len((nvidia or amd)) > 1:
+                gpu_cfg_text = "Multi-GPU detected — GPU acceleration enabled with layer distribution"
+            else:
+                gpu_cfg_text = "GPU acceleration will be enabled automatically"
+        else:
+            gpu_cfg_text = "No compatible GPU found — will run on CPU"
+        gpu_cfg_label = QLabel(f"<i>{gpu_cfg_text}</i>")
+        gpu_cfg_label.setWordWrap(True)
+        layout.addWidget(gpu_cfg_label)
 
         try:
             tag, assets = fetch_release_assets()
@@ -94,8 +111,7 @@ class EngineSetupWidget(QFrame):
                 size_mb = asset.size_bytes / 1_048_576
                 plan = f"Will download: <code>{asset.name}</code> ({size_mb:.0f} MB)"
             else:
-                from llama_installer import check_build_deps
-                missing = check_build_deps(bool(hw.cuda_version))
+                missing = check_build_deps(bool(hw.cuda_version), hw.has_rocm)
                 plan = "Will compile from source" + (
                     f" — missing tools: {', '.join(missing)}" if missing else ""
                 )
@@ -175,6 +191,10 @@ class EngineSetupWidget(QFrame):
 
     def is_done(self) -> bool:
         return self._done
+
+    def gpu_config(self) -> tuple[int, str | None]:
+        """Return (n_gpu_layers, tensor_split_csv_or_None) detected for this machine."""
+        return getattr(self, "_n_gpu_layers", 0), getattr(self, "_tensor_split", None)
 
 
 def _project_root() -> str:
@@ -446,6 +466,11 @@ class SetupWizardDialog(QDialog):
         cfg["persist_dir"] = self.inputs["persist_dir"].text().strip()
         file_rag_dir = self.inputs["file_rag_dir"].text().strip()
         cfg["file_rag_dirs"] = [file_rag_dir] if file_rag_dir else []
+        # Apply auto-detected GPU configuration
+        if self._engine_widget is not None:
+            n_gpu_layers, tensor_split = self._engine_widget.gpu_config()
+            cfg["n_gpu_layers"] = n_gpu_layers
+            cfg["tensor_split"] = tensor_split
         cfg["tts_enabled"] = self.tts_enabled.isChecked()
         cfg["tts_backend"] = "piper"
         cfg["tts_piper_executable"] = self.inputs["tts_piper_executable"].text().strip()

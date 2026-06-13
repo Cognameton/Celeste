@@ -57,17 +57,36 @@ def installed_llama_server() -> Path | None:
 # Hardware detection
 # ---------------------------------------------------------------------------
 
+class GpuInfo(NamedTuple):
+    vendor: str      # "nvidia" | "amd"
+    name: str
+    vram_mb: int
+
+
 class HardwareInfo(NamedTuple):
     has_nvidia: bool
     cuda_version: tuple[int, int] | None  # (major, minor) from driver; None = no CUDA
     cpu_flags: frozenset[str]
+    gpus: tuple[GpuInfo, ...]             # all detected GPUs with VRAM info
+    has_rocm: bool                        # ROCm toolkit present (hipcc or rocm-smi)
+    has_vulkan: bool                      # Vulkan runtime present
 
     def describe(self) -> str:
-        if self.cuda_version:
-            return f"NVIDIA GPU detected, CUDA {self.cuda_version[0]}.{self.cuda_version[1]}"
-        if self.has_nvidia:
-            return "NVIDIA GPU detected (CUDA version unknown — will use CPU build)"
-        return "No NVIDIA GPU detected — CPU build will be used"
+        nvidia = [g for g in self.gpus if g.vendor == "nvidia"]
+        amd = [g for g in self.gpus if g.vendor == "amd"]
+        if nvidia:
+            names = ", ".join(g.name for g in nvidia)
+            total_vram = sum(g.vram_mb for g in nvidia)
+            cuda_str = f", CUDA {self.cuda_version[0]}.{self.cuda_version[1]}" if self.cuda_version else ""
+            count = f"{len(nvidia)}× " if len(nvidia) > 1 else ""
+            return f"{count}NVIDIA {names}{cuda_str} ({total_vram} MB VRAM)"
+        if amd:
+            names = ", ".join(g.name for g in amd)
+            total_vram = sum(g.vram_mb for g in amd)
+            accel = "ROCm" if self.has_rocm else ("Vulkan" if self.has_vulkan else "no GPU accel")
+            count = f"{len(amd)}× " if len(amd) > 1 else ""
+            return f"{count}AMD {names} ({total_vram} MB VRAM, {accel})"
+        return "No GPU detected — CPU inference"
 
 
 def _cpu_flags() -> frozenset[str]:
@@ -121,13 +140,171 @@ def _cuda_from_version_file() -> tuple[int, int] | None:
     return None
 
 
+def _enumerate_nvidia_gpus() -> list[GpuInfo]:
+    """Return one GpuInfo per NVIDIA GPU using nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode()
+        gpus = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                name = parts[1]
+                try:
+                    vram_mb = int(parts[2])
+                except ValueError:
+                    vram_mb = 0
+                gpus.append(GpuInfo(vendor="nvidia", name=name, vram_mb=vram_mb))
+        return gpus
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return []
+
+
+def _enumerate_amd_gpus() -> list[GpuInfo]:
+    """Return one GpuInfo per AMD GPU using rocm-smi or sysfs."""
+    # Try rocm-smi first (most accurate for ROCm-capable cards)
+    try:
+        name_out = subprocess.check_output(
+            ["rocm-smi", "--showproductname", "--csv"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode()
+        vram_out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode()
+        names: list[str] = []
+        for line in name_out.strip().splitlines():
+            if line.startswith("card") or line.startswith("GPU"):
+                parts = line.split(",")
+                names.append(parts[-1].strip() if len(parts) > 1 else "AMD GPU")
+        vrams: list[int] = []
+        for line in vram_out.strip().splitlines():
+            m = re.search(r"(\d+)", line)
+            if m and (line.startswith("card") or line.startswith("GPU")):
+                # rocm-smi reports VRAM in bytes
+                vrams.append(int(m.group(1)) // (1024 * 1024))
+        gpus = []
+        for i, name in enumerate(names):
+            vram = vrams[i] if i < len(vrams) else 0
+            gpus.append(GpuInfo(vendor="amd", name=name, vram_mb=vram))
+        if gpus:
+            return gpus
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+
+    # Fallback: sysfs vendor scan (detects card presence, VRAM via mem_info)
+    gpus = []
+    try:
+        import glob
+        for vendor_path in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
+            try:
+                vendor_id = open(vendor_path).read().strip()
+                if vendor_id.lower() != "0x1002":  # AMD PCI vendor ID
+                    continue
+                card_dir = os.path.dirname(vendor_path)
+                # Try to get product name
+                name = "AMD GPU"
+                label_path = os.path.join(card_dir, "product_name")
+                if os.path.exists(label_path):
+                    name = open(label_path).read().strip() or name
+                # VRAM via mem_info_vram_total (bytes)
+                vram_mb = 0
+                vram_path = os.path.join(card_dir, "mem_info_vram_total")
+                if os.path.exists(vram_path):
+                    vram_mb = int(open(vram_path).read().strip()) // (1024 * 1024)
+                gpus.append(GpuInfo(vendor="amd", name=name, vram_mb=vram_mb))
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        pass
+    return gpus
+
+
+def _detect_rocm() -> bool:
+    """True if the ROCm toolkit is installed (rocm-smi + hipcc reachable)."""
+    if not shutil.which("rocm-smi"):
+        return False
+    # rocm-smi alone means the driver is present; hipcc means we can compile
+    return (
+        shutil.which("hipcc") is not None
+        or os.path.isfile("/opt/rocm/bin/hipcc")
+        or os.path.isfile("/usr/bin/hipcc")
+    )
+
+
+def _detect_vulkan() -> bool:
+    """True if a Vulkan runtime is available."""
+    if shutil.which("vulkaninfo"):
+        try:
+            subprocess.check_output(
+                ["vulkaninfo", "--summary"],
+                stderr=subprocess.DEVNULL, timeout=10,
+            )
+            return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+    # Fallback: check for the ICD loader library
+    for lib in ("/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+                "/usr/lib/libvulkan.so.1",
+                "/usr/local/lib/libvulkan.so.1"):
+        if os.path.exists(lib):
+            return True
+    return False
+
+
 def detect_hardware() -> HardwareInfo:
     if platform.system() != "Linux":
-        return HardwareInfo(has_nvidia=False, cuda_version=None, cpu_flags=_cpu_flags())
+        return HardwareInfo(
+            has_nvidia=False, cuda_version=None, cpu_flags=_cpu_flags(),
+            gpus=(), has_rocm=False, has_vulkan=False,
+        )
 
     cuda = _cuda_from_nvidia_smi() or _cuda_from_nvcc() or _cuda_from_version_file()
-    has_nvidia = cuda is not None or bool(shutil.which("nvidia-smi"))
-    return HardwareInfo(has_nvidia=has_nvidia, cuda_version=cuda, cpu_flags=_cpu_flags())
+    nvidia_gpus = _enumerate_nvidia_gpus()
+    has_nvidia = bool(nvidia_gpus) or cuda is not None or bool(shutil.which("nvidia-smi"))
+
+    amd_gpus = _enumerate_amd_gpus()
+    has_rocm = _detect_rocm()
+    has_vulkan = _detect_vulkan()
+
+    all_gpus = tuple(nvidia_gpus + amd_gpus)
+    return HardwareInfo(
+        has_nvidia=has_nvidia,
+        cuda_version=cuda,
+        cpu_flags=_cpu_flags(),
+        gpus=all_gpus,
+        has_rocm=has_rocm,
+        has_vulkan=has_vulkan,
+    )
+
+
+def compute_gpu_config(hw: HardwareInfo) -> tuple[int, str | None]:
+    """
+    Return (n_gpu_layers, tensor_split_csv_or_None) for the detected hardware.
+    n_gpu_layers=999 means "offload everything" — llama.cpp clips at actual layer count.
+    tensor_split is a comma-separated VRAM-proportional string for multi-GPU setups.
+    Falls back to (0, None) when no usable GPU acceleration is found.
+    """
+    nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
+    amd = [g for g in hw.gpus if g.vendor == "amd"]
+
+    if nvidia and hw.cuda_version:
+        usable = nvidia
+    elif amd and (hw.has_rocm or hw.has_vulkan):
+        usable = amd
+    else:
+        return 0, None  # CPU fallback
+
+    if len(usable) > 1:
+        total_vram = sum(g.vram_mb for g in usable)
+        if total_vram > 0:
+            fracs = [g.vram_mb / total_vram for g in usable]
+            return 999, ",".join(f"{f:.4f}" for f in fracs)
+
+    return 999, None
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +315,8 @@ class ReleaseAsset(NamedTuple):
     name: str
     download_url: str
     size_bytes: int
-    cuda_version: tuple[int, int] | None  # None = CPU-only build
+    cuda_version: tuple[int, int] | None  # None for non-CUDA builds
+    asset_type: str                        # "cuda" | "vulkan" | "cpu"
 
 
 def _parse_cuda_from_name(name: str) -> tuple[int, int] | None:
@@ -166,28 +344,57 @@ def fetch_release_assets() -> tuple[str, list[ReleaseAsset]]:
             continue
         if "ubuntu" not in name and "linux" not in name.lower():
             continue
-        cuda = _parse_cuda_from_name(name) if "cuda" in name else None
-        # Skip CUDA assets where we can't parse the version
-        if "cuda" in name and cuda is None:
-            continue
-        assets.append(ReleaseAsset(
-            name=name,
-            download_url=a["browser_download_url"],
-            size_bytes=a.get("size", 0),
-            cuda_version=cuda,
-        ))
+
+        if "cuda" in name:
+            cuda = _parse_cuda_from_name(name)
+            if cuda is None:
+                continue  # skip malformed CUDA asset names
+            assets.append(ReleaseAsset(
+                name=name,
+                download_url=a["browser_download_url"],
+                size_bytes=a.get("size", 0),
+                cuda_version=cuda,
+                asset_type="cuda",
+            ))
+        elif "vulkan" in name.lower():
+            assets.append(ReleaseAsset(
+                name=name,
+                download_url=a["browser_download_url"],
+                size_bytes=a.get("size", 0),
+                cuda_version=None,
+                asset_type="vulkan",
+            ))
+        else:
+            assets.append(ReleaseAsset(
+                name=name,
+                download_url=a["browser_download_url"],
+                size_bytes=a.get("size", 0),
+                cuda_version=None,
+                asset_type="cpu",
+            ))
     return tag, assets
 
 
 def select_best_asset(assets: list[ReleaseAsset], hw: HardwareInfo) -> ReleaseAsset | None:
     """Return the best pre-built asset for the given hardware."""
-    if hw.cuda_version:
-        cuda_assets = [a for a in assets if a.cuda_version is not None]
+    nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
+    amd = [g for g in hw.gpus if g.vendor == "amd"]
+
+    # NVIDIA with known CUDA version → pick best matching CUDA build
+    if nvidia and hw.cuda_version:
+        cuda_assets = [a for a in assets if a.asset_type == "cuda"]
         compatible = [a for a in cuda_assets if a.cuda_version <= hw.cuda_version]
         if compatible:
             return max(compatible, key=lambda a: a.cuda_version)  # type: ignore[return-value]
 
-    cpu_assets = [a for a in assets if a.cuda_version is None]
+    # AMD with Vulkan → pick Vulkan build (works without full ROCm toolkit)
+    if amd and hw.has_vulkan:
+        vulkan_assets = [a for a in assets if a.asset_type == "vulkan"]
+        if vulkan_assets:
+            return vulkan_assets[0]
+
+    # Everything else → CPU build
+    cpu_assets = [a for a in assets if a.asset_type == "cpu"]
     return cpu_assets[0] if cpu_assets else None
 
 
@@ -256,10 +463,14 @@ def install_from_asset(
 LogCb = Callable[[str], None]
 
 
-def check_build_deps(cuda: bool) -> list[str]:
+def check_build_deps(cuda: bool, rocm: bool = False) -> list[str]:
     missing = [t for t in ("git", "cmake", "gcc", "g++") if not shutil.which(t)]
     if cuda and not shutil.which("nvcc"):
         missing.append("nvcc  (CUDA toolkit — install nvidia-cuda-toolkit)")
+    if rocm:
+        hipcc = shutil.which("hipcc") or os.path.isfile("/opt/rocm/bin/hipcc")
+        if not hipcc:
+            missing.append("hipcc  (ROCm toolkit — install rocm-hip-sdk)")
     return missing
 
 
@@ -267,8 +478,9 @@ def compile_llama_server(
     install_dir: Path,
     cuda: bool,
     log_cb: LogCb | None = None,
+    rocm: bool = False,
 ) -> Path:
-    missing = check_build_deps(cuda)
+    missing = check_build_deps(cuda, rocm)
     if missing:
         raise RuntimeError(
             "Missing build tools: " + ", ".join(missing) + "\n"
@@ -286,6 +498,12 @@ def compile_llama_server(
         ]
         if cuda:
             cmake_args.append("-DGGML_CUDA=ON")
+        elif rocm:
+            cmake_args.append("-DGGML_HIP=ON")
+            # Point cmake at the ROCm toolchain if hipcc isn't in PATH
+            if not shutil.which("hipcc") and os.path.isfile("/opt/rocm/bin/hipcc"):
+                cmake_args += [f"-DCMAKE_C_COMPILER=/opt/rocm/bin/hipcc",
+                               f"-DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc"]
         _run(cmake_args, log_cb)
         _run(
             ["cmake", "--build", str(build), "--target", "llama-server",
@@ -368,7 +586,11 @@ def ensure_llama_server(
         if log_cb:
             log_cb(f"Download failed: {exc}\nFalling back to compile from source…")
 
-    return compile_llama_server(install_dir, cuda=bool(hw.cuda_version), log_cb=log_cb)
+    amd_gpus = [g for g in hw.gpus if g.vendor == "amd"]
+    use_rocm = bool(amd_gpus) and hw.has_rocm and not hw.cuda_version
+    return compile_llama_server(
+        install_dir, cuda=bool(hw.cuda_version), rocm=use_rocm, log_cb=log_cb,
+    )
 
 
 # ---------------------------------------------------------------------------
