@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import urllib.error
@@ -75,11 +76,16 @@ class HardwareInfo(NamedTuple):
         nvidia = [g for g in self.gpus if g.vendor == "nvidia"]
         amd = [g for g in self.gpus if g.vendor == "amd"]
         if nvidia:
-            names = ", ".join(g.name for g in nvidia)
+            # nvidia-smi already includes "NVIDIA" in the name — strip it to avoid doubling
+            clean = [re.sub(r"^NVIDIA\s+", "", g.name, flags=re.IGNORECASE) for g in nvidia]
+            # Collapse identical names: ["RTX 3060", "RTX 3060"] → "2× RTX 3060"
+            if len(set(clean)) == 1:
+                name_str = (f"{len(clean)}× " if len(clean) > 1 else "") + clean[0]
+            else:
+                name_str = ", ".join(clean)
             total_vram = sum(g.vram_mb for g in nvidia)
             cuda_str = f", CUDA {self.cuda_version[0]}.{self.cuda_version[1]}" if self.cuda_version else ""
-            count = f"{len(nvidia)}× " if len(nvidia) > 1 else ""
-            return f"{count}NVIDIA {names}{cuda_str} ({total_vram} MB VRAM)"
+            return f"NVIDIA {name_str}{cuda_str} ({total_vram} MB VRAM)"
         if amd:
             names = ", ".join(g.name for g in amd)
             total_vram = sum(g.vram_mb for g in amd)
@@ -319,11 +325,6 @@ class ReleaseAsset(NamedTuple):
     asset_type: str                        # "cuda" | "vulkan" | "cpu"
 
 
-def _parse_cuda_from_name(name: str) -> tuple[int, int] | None:
-    m = re.search(r"cu(\d+)\.(\d+)", name)
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
 def fetch_release_assets() -> tuple[str, list[ReleaseAsset]]:
     """Return (release_tag, linux_x64_assets) from the latest llama.cpp release."""
     req = urllib.request.Request(
@@ -340,60 +341,61 @@ def fetch_release_assets() -> tuple[str, list[ReleaseAsset]]:
     assets: list[ReleaseAsset] = []
     for a in data.get("assets", []):
         name: str = a["name"]
-        if not name.endswith("-x64.zip"):
+        # Linux x86-64 tarballs (no arm64/s390x/sycl/openvino)
+        if not name.endswith("-x64.tar.gz"):
             continue
         if "ubuntu" not in name and "linux" not in name.lower():
             continue
+        if any(skip in name.lower() for skip in ("arm64", "s390x", "sycl", "openvino")):
+            continue
 
-        if "cuda" in name:
-            cuda = _parse_cuda_from_name(name)
-            if cuda is None:
-                continue  # skip malformed CUDA asset names
-            assets.append(ReleaseAsset(
-                name=name,
-                download_url=a["browser_download_url"],
-                size_bytes=a.get("size", 0),
-                cuda_version=cuda,
-                asset_type="cuda",
-            ))
+        if "rocm" in name.lower():
+            asset_type = "rocm"
         elif "vulkan" in name.lower():
-            assets.append(ReleaseAsset(
-                name=name,
-                download_url=a["browser_download_url"],
-                size_bytes=a.get("size", 0),
-                cuda_version=None,
-                asset_type="vulkan",
-            ))
+            asset_type = "vulkan"
         else:
-            assets.append(ReleaseAsset(
-                name=name,
-                download_url=a["browser_download_url"],
-                size_bytes=a.get("size", 0),
-                cuda_version=None,
-                asset_type="cpu",
-            ))
+            asset_type = "cpu"
+
+        assets.append(ReleaseAsset(
+            name=name,
+            download_url=a["browser_download_url"],
+            size_bytes=a.get("size", 0),
+            cuda_version=None,   # no CUDA-specific Linux pre-builts in recent releases
+            asset_type=asset_type,
+        ))
     return tag, assets
 
 
 def select_best_asset(assets: list[ReleaseAsset], hw: HardwareInfo) -> ReleaseAsset | None:
-    """Return the best pre-built asset for the given hardware."""
+    """
+    Return the best pre-built asset for the detected hardware.
+
+    Priority:
+      AMD + ROCm runtime  → ROCm pre-built  (best AMD performance)
+      AMD/NVIDIA + Vulkan → Vulkan build    (GPU-accelerated, no toolkit needed)
+      anything else       → CPU build       (safe fallback)
+
+    Note: llama.cpp no longer ships CUDA-specific Linux pre-builts; the Vulkan
+    build covers NVIDIA via Vulkan compute and is the recommended download path.
+    Compile-from-source with GGML_CUDA=ON remains available for users who need
+    maximum CUDA performance.
+    """
     nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
     amd = [g for g in hw.gpus if g.vendor == "amd"]
 
-    # NVIDIA with known CUDA version → pick best matching CUDA build
-    if nvidia and hw.cuda_version:
-        cuda_assets = [a for a in assets if a.asset_type == "cuda"]
-        compatible = [a for a in cuda_assets if a.cuda_version <= hw.cuda_version]
-        if compatible:
-            return max(compatible, key=lambda a: a.cuda_version)  # type: ignore[return-value]
+    # AMD with ROCm runtime installed → pre-built ROCm binary
+    if amd and hw.has_rocm:
+        rocm_assets = [a for a in assets if a.asset_type == "rocm"]
+        if rocm_assets:
+            return rocm_assets[0]
 
-    # AMD with Vulkan → pick Vulkan build (works without full ROCm toolkit)
-    if amd and hw.has_vulkan:
+    # Any GPU-capable machine with Vulkan → Vulkan build
+    if (nvidia or amd) and hw.has_vulkan:
         vulkan_assets = [a for a in assets if a.asset_type == "vulkan"]
         if vulkan_assets:
             return vulkan_assets[0]
 
-    # Everything else → CPU build
+    # CPU fallback
     cpu_assets = [a for a in assets if a.asset_type == "cpu"]
     return cpu_assets[0] if cpu_assets else None
 
@@ -420,17 +422,30 @@ def _download(url: str, dest: Path, progress_cb: ProgressCb | None = None) -> No
                     progress_cb(downloaded, total)
 
 
-def _extract_server_files(zip_path: Path, install_dir: Path) -> None:
+def _extract_server_files(archive_path: Path, install_dir: Path) -> None:
+    """Extract llama-server and companion .so files from a .tar.gz or .zip archive."""
     install_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        for member in zf.namelist():
-            basename = os.path.basename(member)
-            if not basename:
-                continue
-            if basename == "llama-server" or basename.endswith(".so") or ".so." in basename:
-                target = install_dir / basename
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+    name = archive_path.name.lower()
+
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        with tarfile.open(archive_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                basename = os.path.basename(member.name)
+                if not basename:
+                    continue
+                if basename == "llama-server" or basename.endswith(".so") or ".so." in basename:
+                    member.name = basename  # flatten into install_dir
+                    tf.extract(member, install_dir, set_attrs=False)
+    else:
+        with zipfile.ZipFile(archive_path) as zf:
+            for member in zf.namelist():
+                basename = os.path.basename(member)
+                if not basename:
+                    continue
+                if basename == "llama-server" or basename.endswith(".so") or ".so." in basename:
+                    target = install_dir / basename
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
 
     server = install_dir / "llama-server"
     if server.exists():
@@ -443,11 +458,11 @@ def install_from_asset(
     progress_cb: ProgressCb | None = None,
 ) -> Path:
     with tempfile.TemporaryDirectory(prefix="celeste-llama-") as tmp:
-        zip_path = Path(tmp) / asset.name
+        archive_path = Path(tmp) / asset.name
         log.info("Downloading %s (%.0f MB)…", asset.name, asset.size_bytes / 1_048_576)
-        _download(asset.download_url, zip_path, progress_cb)
+        _download(asset.download_url, archive_path, progress_cb)
         log.info("Extracting llama-server…")
-        _extract_server_files(zip_path, install_dir)
+        _extract_server_files(archive_path, install_dir)
 
     server = install_dir / "llama-server"
     if not server.is_file():
