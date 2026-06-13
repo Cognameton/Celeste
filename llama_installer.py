@@ -87,11 +87,14 @@ class HardwareInfo(NamedTuple):
             cuda_str = f", CUDA {self.cuda_version[0]}.{self.cuda_version[1]}" if self.cuda_version else ""
             return f"NVIDIA {name_str}{cuda_str} ({total_vram} MB VRAM)"
         if amd:
-            names = ", ".join(g.name for g in amd)
+            clean = [g.name for g in amd]
+            if len(set(clean)) == 1:
+                name_str = (f"{len(clean)}× " if len(clean) > 1 else "") + clean[0]
+            else:
+                name_str = ", ".join(clean)
             total_vram = sum(g.vram_mb for g in amd)
             accel = "ROCm" if self.has_rocm else ("Vulkan" if self.has_vulkan else "no GPU accel")
-            count = f"{len(amd)}× " if len(amd) > 1 else ""
-            return f"{count}AMD {names} ({total_vram} MB VRAM, {accel})"
+            return f"AMD {name_str} ({total_vram} MB VRAM, {accel})"
         return "No GPU detected — CPU inference"
 
 
@@ -170,53 +173,71 @@ def _enumerate_nvidia_gpus() -> list[GpuInfo]:
 
 
 def _enumerate_amd_gpus() -> list[GpuInfo]:
-    """Return one GpuInfo per AMD GPU using rocm-smi or sysfs."""
-    # Try rocm-smi first (most accurate for ROCm-capable cards)
-    try:
-        name_out = subprocess.check_output(
-            ["rocm-smi", "--showproductname", "--csv"],
-            stderr=subprocess.DEVNULL, timeout=10,
-        ).decode()
-        vram_out = subprocess.check_output(
-            ["rocm-smi", "--showmeminfo", "vram", "--csv"],
-            stderr=subprocess.DEVNULL, timeout=10,
-        ).decode()
-        names: list[str] = []
-        for line in name_out.strip().splitlines():
-            if line.startswith("card") or line.startswith("GPU"):
-                parts = line.split(",")
-                names.append(parts[-1].strip() if len(parts) > 1 else "AMD GPU")
-        vrams: list[int] = []
-        for line in vram_out.strip().splitlines():
-            m = re.search(r"(\d+)", line)
-            if m and (line.startswith("card") or line.startswith("GPU")):
-                # rocm-smi reports VRAM in bytes
-                vrams.append(int(m.group(1)) // (1024 * 1024))
-        gpus = []
-        for i, name in enumerate(names):
-            vram = vrams[i] if i < len(vrams) else 0
-            gpus.append(GpuInfo(vendor="amd", name=name, vram_mb=vram))
-        if gpus:
-            return gpus
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
-        pass
+    """Return one GpuInfo per AMD GPU using rocm-smi (JSON) or sysfs."""
 
-    # Fallback: sysfs vendor scan (detects card presence, VRAM via mem_info)
+    # Primary: rocm-smi --json gives stable structured output across ROCm versions
+    # and correctly enumerates every card in a multi-GPU system.
+    if shutil.which("rocm-smi"):
+        try:
+            raw = subprocess.check_output(
+                ["rocm-smi", "--showproductname", "--showmeminfo", "vram", "--json"],
+                stderr=subprocess.DEVNULL, timeout=15,
+            ).decode()
+            data = json.loads(raw)
+            gpus: list[GpuInfo] = []
+            # Keys are "card0", "card1", ... or "GPU[0]", "GPU[1]", ...
+            for key in sorted(data.keys()):
+                if not (key.startswith("card") or key.startswith("GPU")):
+                    continue
+                entry = data[key]
+                # Name: "Card Series" or "GPU ID" fallback
+                name = (
+                    entry.get("Card Series")
+                    or entry.get("Card Model")
+                    or entry.get("GPU ID")
+                    or "AMD GPU"
+                )
+                name = str(name).strip() or "AMD GPU"
+                # VRAM total is reported in bytes under several possible keys
+                vram_bytes = 0
+                for vram_key in (
+                    "VRAM Total Memory (B)",
+                    "Total VRAM (B)",
+                    "vram_total",
+                    "memoryTotal",
+                ):
+                    raw_vram = entry.get(vram_key)
+                    if raw_vram is not None:
+                        try:
+                            vram_bytes = int(raw_vram)
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                gpus.append(GpuInfo(vendor="amd", name=name, vram_mb=vram_bytes // (1024 * 1024)))
+            if gpus:
+                return gpus
+        except (FileNotFoundError, subprocess.SubprocessError, OSError,
+                json.JSONDecodeError, KeyError, ValueError):
+            pass
+
+    # Fallback: sysfs vendor scan — works even without ROCm userspace tools.
+    # /sys/class/drm/card* enumerates DRM devices; vendor 0x1002 = AMD.
     gpus = []
     try:
         import glob
         for vendor_path in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
             try:
-                vendor_id = open(vendor_path).read().strip()
-                if vendor_id.lower() != "0x1002":  # AMD PCI vendor ID
+                if open(vendor_path).read().strip().lower() != "0x1002":
                     continue
                 card_dir = os.path.dirname(vendor_path)
-                # Try to get product name
                 name = "AMD GPU"
-                label_path = os.path.join(card_dir, "product_name")
-                if os.path.exists(label_path):
-                    name = open(label_path).read().strip() or name
-                # VRAM via mem_info_vram_total (bytes)
+                for name_file in ("product_name", "subsystem_device"):
+                    p = os.path.join(card_dir, name_file)
+                    if os.path.exists(p):
+                        candidate = open(p).read().strip()
+                        if candidate:
+                            name = candidate
+                            break
                 vram_mb = 0
                 vram_path = os.path.join(card_dir, "mem_info_vram_total")
                 if os.path.exists(vram_path):

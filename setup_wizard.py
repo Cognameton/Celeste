@@ -91,10 +91,9 @@ class EngineSetupWidget(QFrame):
         layout.addWidget(hw_label)
 
         if self._n_gpu_layers > 0:
-            nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
-            amd = [g for g in hw.gpus if g.vendor == "amd"]
-            if len((nvidia or amd)) > 1:
-                gpu_cfg_text = "Multi-GPU detected — GPU acceleration enabled with layer distribution"
+            if self._tensor_split is not None:
+                n = len(self._tensor_split.split(","))
+                gpu_cfg_text = f"{n}× GPU detected — acceleration enabled with proportional layer distribution"
             else:
                 gpu_cfg_text = "GPU acceleration will be enabled automatically"
         else:
