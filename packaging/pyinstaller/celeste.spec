@@ -83,6 +83,21 @@ a = Analysis(
     optimize=0,
 )
 
+# Post-analysis strip: remove nvidia and triton files collected by built-in hooks.
+# The excludes[] list only prevents Python module import graph traversal; binary
+# collection hooks fire regardless.  Filtering a.binaries / a.datas here is the
+# only reliable way to keep them out of the bundle.
+a.binaries = TOC([
+    (name, src, typ)
+    for name, src, typ in a.binaries
+    if not _is_stripped(name) and not _is_stripped(src or "")
+])
+a.datas = TOC([
+    (name, src, typ)
+    for name, src, typ in a.datas
+    if not _is_stripped(name) and not _is_stripped(src or "")
+])
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
