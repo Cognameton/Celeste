@@ -35,6 +35,41 @@ if [ -d "$PROJECT_ROOT/voices" ]; then
   cp -a "$PROJECT_ROOT/voices" "$PROJECT_ROOT/dist/Celeste/voices"
 fi
 
+# Generate install.sh — the only step the end-user needs to run
+cat > "$PROJECT_ROOT/dist/Celeste/install.sh" <<'INSTALL_SH'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Make the main binary executable (may have lost +x in extraction)
+chmod +x "$SCRIPT_DIR/Celeste"
+
+# Create desktop shortcut
+DESKTOP_FILE="$HOME/.local/share/applications/celeste.desktop"
+mkdir -p "$HOME/.local/share/applications"
+cat > "$DESKTOP_FILE" <<DESKTOP
+[Desktop Entry]
+Version=1.0
+Name=Celeste
+Comment=Local AI assistant
+Exec=$SCRIPT_DIR/Celeste
+Icon=$SCRIPT_DIR/assets/celeste_icon.png
+Type=Application
+Categories=Utility;Office;
+Terminal=false
+DESKTOP
+chmod +x "$DESKTOP_FILE"
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
+echo ""
+echo "Celeste installed successfully."
+echo "You can launch it from your application menu or by running:"
+echo "  $SCRIPT_DIR/Celeste"
+echo ""
+echo "On first launch, the setup wizard will configure Celeste for your hardware."
+INSTALL_SH
+chmod +x "$PROJECT_ROOT/dist/Celeste/install.sh"
+
 mkdir -p "$PROJECT_ROOT/dist/packages"
 tar -C "$PROJECT_ROOT/dist" -czf "$PROJECT_ROOT/dist/packages/Celeste-linux-x86_64.tar.gz" Celeste
 

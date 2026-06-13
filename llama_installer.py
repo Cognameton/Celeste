@@ -3,7 +3,11 @@ llama_installer.py — Hardware-adaptive llama-server setup for Linux.
 
 Detects NVIDIA GPU + CUDA version, downloads the best matching pre-built
 llama.cpp release from GitHub, falls back to compiling from source when
-no pre-built matches, and installs everything to ~/.local/share/Celeste/llama/.
+no pre-built matches.
+
+Install location:
+  - Packaged app: <bundle>/vendor/llama.cpp/build/bin/  (self-contained)
+  - Dev mode:     ~/.local/share/Celeste/llama/
 """
 from __future__ import annotations
 
@@ -34,6 +38,12 @@ LLAMA_CPP_REPO = "https://github.com/ggerganov/llama.cpp.git"
 # ---------------------------------------------------------------------------
 
 def llama_install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        # Packaged app — install into the bundle's own vendor tree so the app
+        # is fully self-contained in whatever directory the user extracted it to.
+        from app_paths import runtime_root
+        return Path(runtime_root()) / "vendor" / "llama.cpp" / "build" / "bin"
+    # Dev mode
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     return Path(base) / "Celeste" / "llama"
 
@@ -362,173 +372,31 @@ def ensure_llama_server(
 
 
 # ---------------------------------------------------------------------------
-# GUI dialog (PySide6)
+# PySide6 worker — used by setup_wizard.py's embedded setup section
 # ---------------------------------------------------------------------------
 
-def run_installer_dialog(app=None) -> bool:
+class InstallerWorker:
     """
-    Show the llama-server setup dialog.  Returns True if llama-server was
-    successfully installed, False if the user cancelled or installation failed.
+    Import this into setup_wizard.py to run ensure_llama_server in a QThread.
+    Kept here so all installer logic stays in one module.
     """
-    try:
-        from PySide6.QtCore import QObject, QThread, Signal, Slot
-        from PySide6.QtWidgets import (
-            QDialog, QDialogButtonBox, QLabel, QPlainTextEdit,
-            QProgressBar, QPushButton, QVBoxLayout, QHBoxLayout, QSizePolicy,
-        )
-    except ImportError:
-        log.error("PySide6 not available; cannot show installer dialog")
-        return False
+    @staticmethod
+    def make_qobject():
+        from PySide6.QtCore import QObject, Signal
 
-    hw = detect_hardware()
+        class _Worker(QObject):
+            progress = Signal(int, int)   # downloaded_bytes, total_bytes
+            log_line = Signal(str)
+            finished = Signal(bool, str)  # success, error_message
 
-    try:
-        tag, assets = fetch_release_assets()
-        asset = select_best_asset(assets, hw)
-    except Exception:
-        asset = None
-        tag = "unknown"
-
-    class Worker(QObject):
-        progress = Signal(int, int)   # downloaded, total
-        log_line = Signal(str)
-        finished = Signal(bool, str)  # success, message
-
-        def run(self):
-            try:
-                def pcb(d, t):
-                    self.progress.emit(d, t)
-                def lcb(line):
-                    self.log_line.emit(line)
-                ensure_llama_server(progress_cb=pcb, log_cb=lcb)
-                self.finished.emit(True, "")
-            except Exception as exc:
-                self.finished.emit(False, str(exc))
-
-    class InstallerDialog(QDialog):
-        def __init__(self):
-            super().__init__()
-            self.setWindowTitle("Celeste — AI Engine Setup")
-            self.setMinimumWidth(520)
-            self._success = False
-
-            layout = QVBoxLayout(self)
-            layout.setSpacing(12)
-
-            # Hardware info
-            hw_label = QLabel(f"<b>Hardware:</b> {hw.describe()}")
-            hw_label.setWordWrap(True)
-            layout.addWidget(hw_label)
-
-            # What will be downloaded/compiled
-            if asset:
-                size_mb = asset.size_bytes / 1_048_576
-                action_text = (
-                    f"<b>Action:</b> Download <code>{asset.name}</code>"
-                    f" ({size_mb:.0f} MB) from the latest llama.cpp release ({tag})"
-                )
-            else:
-                missing = check_build_deps(bool(hw.cuda_version))
-                if missing:
-                    action_text = (
-                        "<b>Action:</b> Compile from source<br>"
-                        f"<span style='color:orange'>Missing build tools: {', '.join(missing)}</span>"
+            def run(self):
+                try:
+                    ensure_llama_server(
+                        progress_cb=lambda d, t: self.progress.emit(d, t),
+                        log_cb=lambda line: self.log_line.emit(line),
                     )
-                else:
-                    action_text = "<b>Action:</b> Compile from source (no pre-built matched your hardware)"
-            action_label = QLabel(action_text)
-            action_label.setWordWrap(True)
-            layout.addWidget(action_label)
+                    self.finished.emit(True, "")
+                except Exception as exc:
+                    self.finished.emit(False, str(exc))
 
-            # Progress bar
-            self._progress = QProgressBar()
-            self._progress.setRange(0, 100)
-            self._progress.setValue(0)
-            self._progress.setVisible(False)
-            layout.addWidget(self._progress)
-
-            # Log output
-            self._log = QPlainTextEdit()
-            self._log.setReadOnly(True)
-            self._log.setMaximumHeight(160)
-            self._log.setVisible(False)
-            layout.addWidget(self._log)
-
-            # Status label
-            self._status = QLabel("Click 'Set Up' to begin.")
-            self._status.setWordWrap(True)
-            layout.addWidget(self._status)
-
-            # Buttons
-            btn_row = QHBoxLayout()
-            self._setup_btn = QPushButton("Set Up")
-            self._setup_btn.setDefault(True)
-            self._skip_btn = QPushButton("Skip (launch without AI engine)")
-            btn_row.addWidget(self._setup_btn)
-            btn_row.addWidget(self._skip_btn)
-            layout.addLayout(btn_row)
-
-            self._setup_btn.clicked.connect(self._start_install)
-            self._skip_btn.clicked.connect(self.reject)
-
-            self._thread: QThread | None = None
-            self._worker: Worker | None = None
-
-        def _start_install(self):
-            self._setup_btn.setEnabled(False)
-            self._skip_btn.setEnabled(False)
-            self._progress.setVisible(True)
-            self._log.setVisible(True)
-            self._status.setText("Setting up AI engine…")
-
-            self._worker = Worker()
-            self._thread = QThread()
-            self._worker.moveToThread(self._thread)
-            self._thread.started.connect(self._worker.run)
-            self._worker.progress.connect(self._on_progress)
-            self._worker.log_line.connect(self._on_log)
-            self._worker.finished.connect(self._on_finished)
-            self._thread.start()
-
-        @Slot(int, int)
-        def _on_progress(self, downloaded: int, total: int):
-            pct = int(downloaded * 100 / total)
-            self._progress.setValue(pct)
-            mb_done = downloaded / 1_048_576
-            mb_total = total / 1_048_576
-            self._status.setText(f"Downloading… {mb_done:.1f} / {mb_total:.1f} MB")
-
-        @Slot(str)
-        def _on_log(self, line: str):
-            self._log.appendPlainText(line)
-            self._log.verticalScrollBar().setValue(
-                self._log.verticalScrollBar().maximum()
-            )
-            self._status.setText(line[:120])
-
-        @Slot(bool, str)
-        def _on_finished(self, success: bool, message: str):
-            if self._thread:
-                self._thread.quit()
-                self._thread.wait()
-            self._progress.setValue(100)
-            if success:
-                self._success = True
-                self._status.setText("AI engine installed successfully.")
-                done_btn = QPushButton("Launch Celeste")
-                done_btn.clicked.connect(self.accept)
-                layout = self.layout()
-                layout.addWidget(done_btn)
-                done_btn.setFocus()
-            else:
-                self._status.setText(f"Installation failed:\n{message}")
-                self._setup_btn.setText("Retry")
-                self._setup_btn.setEnabled(True)
-                self._skip_btn.setEnabled(True)
-
-        def succeeded(self) -> bool:
-            return self._success
-
-    dialog = InstallerDialog()
-    result = dialog.exec()
-    return dialog.succeeded()
+        return _Worker()

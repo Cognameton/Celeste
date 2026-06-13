@@ -5,13 +5,14 @@ import argparse
 import copy
 import fnmatch
 import os
+import platform
 import shutil
 import sys
 
 import yaml
 
 try:
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QThread, QTimer, Slot
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import (
         QApplication,
@@ -19,10 +20,13 @@ try:
         QDialog,
         QFileDialog,
         QFormLayout,
+        QFrame,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QMessageBox,
+        QPlainTextEdit,
+        QProgressBar,
         QPushButton,
         QScrollArea,
         QTextBrowser,
@@ -37,6 +41,140 @@ except ImportError as exc:  # pragma: no cover - runtime dependency
 
 from app_paths import default_config_path, resource_path, runtime_root
 from validate_environment import format_checks, has_errors, validate_config_file
+
+
+# ---------------------------------------------------------------------------
+# Embedded AI engine setup widget (Linux packaged builds only)
+# ---------------------------------------------------------------------------
+
+def _needs_engine_setup() -> bool:
+    """True when running as a packaged Linux app without llama-server yet."""
+    if not getattr(sys, "frozen", False):
+        return False
+    if platform.system() != "Linux":
+        return False
+    from llama_installer import installed_llama_server
+    return installed_llama_server() is None
+
+
+class EngineSetupWidget(QFrame):
+    """
+    Self-contained widget that detects hardware and downloads/compiles
+    llama-server automatically.  Embed at the top of the setup wizard.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.StyledPanel)
+        self._done = False
+        self._thread = None
+        self._worker = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        title = QLabel("<b>Step 1 — Setting up the AI Engine</b>")
+        layout.addWidget(title)
+
+        from llama_installer import detect_hardware, fetch_release_assets, select_best_asset
+        hw = detect_hardware()
+        self._hw = hw
+
+        hw_label = QLabel(f"Detected: {hw.describe()}")
+        hw_label.setWordWrap(True)
+        layout.addWidget(hw_label)
+
+        try:
+            tag, assets = fetch_release_assets()
+            asset = select_best_asset(assets, hw)
+            self._asset = asset
+            if asset:
+                size_mb = asset.size_bytes / 1_048_576
+                plan = f"Will download: <code>{asset.name}</code> ({size_mb:.0f} MB)"
+            else:
+                from llama_installer import check_build_deps
+                missing = check_build_deps(bool(hw.cuda_version))
+                plan = "Will compile from source" + (
+                    f" — missing tools: {', '.join(missing)}" if missing else ""
+                )
+        except Exception as exc:
+            self._asset = None
+            plan = f"Could not reach GitHub releases ({exc}). Will compile from source."
+
+        plan_label = QLabel(plan)
+        plan_label.setWordWrap(True)
+        layout.addWidget(plan_label)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        layout.addWidget(self._progress)
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumHeight(100)
+        self._log.setVisible(False)
+        layout.addWidget(self._log)
+
+        self._status = QLabel("Starting…")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+
+        # Auto-start after the dialog renders
+        QTimer.singleShot(200, self._start)
+
+    def _start(self):
+        from llama_installer import InstallerWorker
+        self._worker = InstallerWorker.make_qobject()
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log_line.connect(self._on_log)
+        self._worker.finished.connect(self._on_finished)
+        self._thread.start()
+
+    @Slot(int, int)
+    def _on_progress(self, downloaded: int, total: int):
+        pct = int(downloaded * 100 / total)
+        self._progress.setValue(pct)
+        mb_d = downloaded / 1_048_576
+        mb_t = total / 1_048_576
+        self._status.setText(f"Downloading… {mb_d:.1f} / {mb_t:.1f} MB")
+
+    @Slot(str)
+    def _on_log(self, line: str):
+        self._log.setVisible(True)
+        self._log.appendPlainText(line)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        self._status.setText(line[:120])
+
+    @Slot(bool, str)
+    def _on_finished(self, success: bool, message: str):
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait()
+        if success:
+            self._done = True
+            self._progress.setValue(100)
+            self._status.setText("AI engine ready.")
+            self.setStyleSheet("QFrame { border: 1px solid #4CAF50; border-radius: 4px; }")
+            # Notify parent wizard
+            wizard = self.parent()
+            while wizard and not isinstance(wizard, SetupWizardDialog):
+                wizard = wizard.parent()
+            if wizard:
+                wizard.on_engine_ready()
+        else:
+            self._status.setText(f"Setup failed: {message}")
+            retry = QPushButton("Retry")
+            retry.clicked.connect(self._start)
+            self.layout().addWidget(retry)
+
+    def is_done(self) -> bool:
+        return self._done
 
 
 def _project_root() -> str:
@@ -155,25 +293,46 @@ class SetupWizardDialog(QDialog):
         self.template = _load_template(template_path)
         self.defaults = _default_paths()
         self.inputs: dict[str, QLineEdit] = {}
+        self._engine_widget: EngineSetupWidget | None = None
         self.setWindowTitle("Celeste First-Run Setup")
         icon_path = resource_path("assets", "celeste_icon.png")
         if os.path.isfile(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        self.resize(900, 760)
+        self.resize(900, 800)
         self._build_ui()
+
+    # Called by EngineSetupWidget when download/compile finishes successfully
+    def on_engine_ready(self):
+        self.save_button.setEnabled(True)
+        self.validate_button.setEnabled(True)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        title = QLabel("Celeste Setup Wizard")
+        title = QLabel("Celeste Setup")
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(title)
 
-        intro = QLabel(
-            "Choose local model, embedding, document, and data paths. "
-            "You can keep the suggested default folders or browse to your own existing paths."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
+        # On packaged Linux builds, embed the engine setup widget first
+        show_engine_setup = _needs_engine_setup()
+        self._show_engine_setup = show_engine_setup
+        if show_engine_setup:
+            self._engine_widget = EngineSetupWidget(self)
+            layout.addWidget(self._engine_widget)
+
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(sep)
+
+            step2_label = QLabel("<b>Step 2 — Configure paths</b>")
+            layout.addWidget(step2_label)
+        else:
+            intro = QLabel(
+                "Choose local model, embedding, document, and data paths. "
+                "You can keep the suggested default folders or browse to your own."
+            )
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
 
         use_defaults = QPushButton("Use Default Celeste Folders")
         use_defaults.clicked.connect(self._apply_default_paths)
@@ -191,29 +350,22 @@ class SetupWizardDialog(QDialog):
 
         self.inputs["model_path"] = self._add_path_row(form, "GGUF Model", self.defaults["model_path"], "file")
         self.inputs["embedding_model"] = self._add_path_row(
-            form,
-            "Embedding Model",
-            self.defaults["embedding_model"],
-            "directory",
+            form, "Embedding Model", self.defaults["embedding_model"], "directory",
         )
-        self.inputs["llama_server_executable"] = self._add_path_row(
-            form,
-            "llama-server",
-            self.defaults["llama_server_executable"],
-            "file",
-        )
+
+        # Only show llama-server path on non-packaged Linux builds; packaged
+        # Linux handles it automatically via EngineSetupWidget.
+        if not show_engine_setup:
+            self.inputs["llama_server_executable"] = self._add_path_row(
+                form, "llama-server", self.defaults["llama_server_executable"], "file",
+            )
+
         self.inputs["data_dir"] = self._add_path_row(form, "Data Directory", self.defaults["data_dir"], "directory")
         self.inputs["persist_dir"] = self._add_path_row(
-            form,
-            "Vector DB Directory",
-            self.defaults["persist_dir"],
-            "directory",
+            form, "Vector DB Directory", self.defaults["persist_dir"], "directory",
         )
         self.inputs["file_rag_dir"] = self._add_path_row(
-            form,
-            "Document Library",
-            self.defaults["file_rag_dir"],
-            "directory",
+            form, "Document Library", self.defaults["file_rag_dir"], "directory",
         )
 
         self.tts_enabled = QCheckBox("Enable Piper TTS")
@@ -221,22 +373,13 @@ class SetupWizardDialog(QDialog):
         form.addRow("Speech", self.tts_enabled)
 
         self.inputs["tts_piper_executable"] = self._add_path_row(
-            form,
-            "Piper Executable",
-            self.defaults["tts_piper_executable"],
-            "file",
+            form, "Piper Executable", self.defaults["tts_piper_executable"], "file",
         )
         self.inputs["tts_piper_model"] = self._add_path_row(
-            form,
-            "Piper Voice Model",
-            self.defaults["tts_piper_model"],
-            "file",
+            form, "Piper Voice Model", self.defaults["tts_piper_model"], "file",
         )
         self.inputs["tts_piper_config"] = self._add_path_row(
-            form,
-            "Piper Voice Config",
-            self.defaults["tts_piper_config"],
-            "file",
+            form, "Piper Voice Config", self.defaults["tts_piper_config"], "file",
         )
 
         form_layout.addLayout(form)
@@ -244,13 +387,13 @@ class SetupWizardDialog(QDialog):
         layout.addWidget(scroll, 1)
 
         self.validation_view = QTextBrowser()
-        self.validation_view.setFixedHeight(180)
+        self.validation_view.setFixedHeight(160)
         self.validation_view.setPlaceholderText("Validation output will appear here.")
         layout.addWidget(self.validation_view)
 
         button_row = QHBoxLayout()
         self.validate_button = QPushButton("Validate")
-        self.save_button = QPushButton("Save Config")
+        self.save_button = QPushButton("Save && Launch")
         self.cancel_button = QPushButton("Cancel")
         self.validate_button.clicked.connect(self._validate_current_settings)
         self.save_button.clicked.connect(self._save_config)
@@ -260,6 +403,11 @@ class SetupWizardDialog(QDialog):
         button_row.addWidget(self.cancel_button)
         button_row.addStretch(1)
         layout.addLayout(button_row)
+
+        # On packaged Linux, disable Save until the engine setup completes
+        if show_engine_setup:
+            self.save_button.setEnabled(False)
+            self.validate_button.setEnabled(False)
 
     def _add_path_row(self, form: QFormLayout, label: str, value: str, mode: str) -> QLineEdit:
         edit = QLineEdit(value)
@@ -289,7 +437,11 @@ class SetupWizardDialog(QDialog):
         cfg = copy.deepcopy(self.template)
         cfg["model_path"] = self.inputs["model_path"].text().strip()
         cfg["embedding_model"] = self.inputs["embedding_model"].text().strip()
-        cfg["llama_server_executable"] = self.inputs["llama_server_executable"].text().strip()
+        if "llama_server_executable" in self.inputs:
+            cfg["llama_server_executable"] = self.inputs["llama_server_executable"].text().strip()
+        else:
+            # Packaged Linux: engine setup widget owns this; use the install path.
+            cfg["llama_server_executable"] = self.defaults["llama_server_executable"]
         cfg["data_dir"] = self.inputs["data_dir"].text().strip()
         cfg["persist_dir"] = self.inputs["persist_dir"].text().strip()
         file_rag_dir = self.inputs["file_rag_dir"].text().strip()
@@ -342,6 +494,10 @@ class SetupWizardDialog(QDialog):
         except Exception as exc:
             self.validation_view.setPlainText(f"[ERROR] config.yaml: {exc}")
             return False
+        # On packaged Linux the engine widget manages llama-server; suppress
+        # any residual error for that subject so it doesn't block the wizard.
+        if getattr(self, "_show_engine_setup", False):
+            checks = [c for c in checks if c.subject != "llama_server_executable"]
         rendered = format_checks(checks)
         self.validation_view.setPlainText(rendered)
         return not has_errors(checks)
