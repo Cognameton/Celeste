@@ -131,7 +131,7 @@ class EngineSetupWidget(QFrame):
             asset = select_best_asset(assets, hw)
             self._asset = asset
             if asset:
-                size_mb = asset.size_bytes / 1_048_576
+                size_mb = asset.total_bytes / 1_048_576
                 plan = f"Will download: <code>{asset.name}</code> ({size_mb:.0f} MB)"
             else:
                 missing = check_build_deps(bool(hw.cuda_version), hw.has_rocm)

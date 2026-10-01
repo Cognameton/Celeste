@@ -2,8 +2,8 @@
 llama_installer.py — Hardware-adaptive llama-server setup for Linux.
 
 Detects NVIDIA GPU + CUDA version, downloads the best matching pre-built
-llama.cpp release from GitHub, falls back to compiling from source when
-no pre-built matches.
+llama.cpp release from GitHub (pinned to a tested tag), falls back to
+compiling from source when no pre-built matches.
 
 Install location:
   - Packaged app: <bundle>/vendor/llama.cpp/build/bin/  (self-contained)
@@ -30,8 +30,11 @@ from typing import Callable, NamedTuple
 
 log = logging.getLogger(__name__)
 
-GITHUB_API_URL = "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest"
-LLAMA_CPP_REPO = "https://github.com/ggerganov/llama.cpp.git"
+# Pinned, tested llama.cpp release. Never use /releases/latest: on 2026-09-23 it
+# started resolving to a tag with no binaries, which broke every Linux first run.
+LLAMA_CPP_TAG = "b11321"
+GITHUB_API_URL = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{LLAMA_CPP_TAG}"
+LLAMA_CPP_REPO = "https://github.com/ggml-org/llama.cpp.git"
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +346,16 @@ class ReleaseAsset(NamedTuple):
     download_url: str
     size_bytes: int
     cuda_version: tuple[int, int] | None  # None for non-CUDA builds
-    asset_type: str                        # "cuda" | "vulkan" | "cpu"
+    asset_type: str                        # "cuda" | "rocm" | "vulkan" | "cpu"
+    runtime: "ReleaseAsset | None" = None  # CUDA builds: matching cudart/cuBLAS libs
+
+    @property
+    def total_bytes(self) -> int:
+        return self.size_bytes + (self.runtime.size_bytes if self.runtime else 0)
 
 
 def fetch_release_assets() -> tuple[str, list[ReleaseAsset]]:
-    """Return (release_tag, linux_x64_assets) from the latest llama.cpp release."""
+    """Return (release_tag, linux_x64_assets) from the pinned llama.cpp release."""
     req = urllib.request.Request(
         GITHUB_API_URL,
         headers={
@@ -357,34 +365,82 @@ def fetch_release_assets() -> tuple[str, list[ReleaseAsset]]:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
+    return parse_release_assets(data)
 
+
+_CUDA_RE = re.compile(r"cuda-(\d+)\.(\d+)-x64", re.IGNORECASE)
+
+
+def parse_release_assets(data: dict) -> tuple[str, list[ReleaseAsset]]:
+    """Pick the Linux x86-64 llama-server builds out of a GitHub release payload."""
     tag: str = data.get("tag_name", "unknown")
     assets: list[ReleaseAsset] = []
+    runtimes: dict[tuple[int, int], ReleaseAsset] = {}
     for a in data.get("assets", []):
         name: str = a["name"]
+        lname = name.lower()
         # Linux x86-64 tarballs (no arm64/s390x/sycl/openvino)
         if not name.endswith("-x64.tar.gz"):
             continue
-        if "ubuntu" not in name and "linux" not in name.lower():
+        if "ubuntu" not in lname and "linux" not in lname:
             continue
-        if any(skip in name.lower() for skip in ("arm64", "s390x", "sycl", "openvino")):
+        if any(skip in lname for skip in ("arm64", "s390x", "sycl", "openvino")):
             continue
 
-        if "rocm" in name.lower():
-            asset_type = "rocm"
-        elif "vulkan" in name.lower():
-            asset_type = "vulkan"
-        else:
-            asset_type = "cpu"
-
-        assets.append(ReleaseAsset(
+        cuda_match = _CUDA_RE.search(name)
+        cuda_version = (int(cuda_match.group(1)), int(cuda_match.group(2))) if cuda_match else None
+        entry = ReleaseAsset(
             name=name,
             download_url=a["browser_download_url"],
             size_bytes=a.get("size", 0),
-            cuda_version=None,   # no CUDA-specific Linux pre-builts in recent releases
-            asset_type=asset_type,
-        ))
-    return tag, assets
+            cuda_version=cuda_version,
+            asset_type="cpu",
+        )
+
+        # cudart-* tarballs hold only the CUDA runtime libs for the matching build
+        if lname.startswith("cudart-"):
+            if cuda_version:
+                runtimes[cuda_version] = entry._replace(asset_type="cuda-runtime")
+            continue
+
+        if cuda_version:
+            asset_type = "cuda"
+        elif "rocm" in lname:
+            asset_type = "rocm"
+        elif "vulkan" in lname:
+            asset_type = "vulkan"
+        else:
+            asset_type = "cpu"
+        assets.append(entry._replace(asset_type=asset_type))
+
+    # Attach each CUDA build's runtime libs; a CUDA build without them is unusable
+    # on machines that have the driver but no CUDA toolkit, so drop it.
+    resolved: list[ReleaseAsset] = []
+    for asset in assets:
+        if asset.asset_type == "cuda":
+            runtime = runtimes.get(asset.cuda_version)
+            if runtime is None:
+                continue
+            asset = asset._replace(runtime=runtime)
+        resolved.append(asset)
+    return tag, resolved
+
+
+def _select_cuda_asset(
+    assets: list[ReleaseAsset], driver_cuda: tuple[int, int],
+) -> ReleaseAsset | None:
+    """
+    Newest CUDA build the driver can run. Same major version is accepted via
+    CUDA minor-version compatibility (a 13.0 driver runs 13.x builds); an older
+    major also works because drivers are backward compatible.
+    """
+    candidates = [
+        a for a in assets
+        if a.asset_type == "cuda" and a.cuda_version and a.cuda_version[0] <= driver_cuda[0]
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda a: a.cuda_version)
 
 
 def select_best_asset(assets: list[ReleaseAsset], hw: HardwareInfo) -> ReleaseAsset | None:
@@ -392,17 +448,19 @@ def select_best_asset(assets: list[ReleaseAsset], hw: HardwareInfo) -> ReleaseAs
     Return the best pre-built asset for the detected hardware.
 
     Priority:
-      AMD + ROCm runtime  → ROCm pre-built  (best AMD performance)
-      AMD/NVIDIA + Vulkan → Vulkan build    (GPU-accelerated, no toolkit needed)
-      anything else       → CPU build       (safe fallback)
-
-    Note: llama.cpp no longer ships CUDA-specific Linux pre-builts; the Vulkan
-    build covers NVIDIA via Vulkan compute and is the recommended download path.
-    Compile-from-source with GGML_CUDA=ON remains available for users who need
-    maximum CUDA performance.
+      NVIDIA + CUDA driver → CUDA pre-built + runtime libs (best NVIDIA performance)
+      AMD + ROCm runtime   → ROCm pre-built  (best AMD performance)
+      any GPU + Vulkan     → Vulkan build    (Intel, AMD without ROCm, old NVIDIA drivers)
+      anything else        → CPU build       (safe fallback)
     """
     nvidia = [g for g in hw.gpus if g.vendor == "nvidia"]
     amd = [g for g in hw.gpus if g.vendor == "amd"]
+
+    # NVIDIA with a CUDA-capable driver → CUDA pre-built (no toolkit needed)
+    if nvidia and hw.cuda_version:
+        cuda_asset = _select_cuda_asset(assets, hw.cuda_version)
+        if cuda_asset:
+            return cuda_asset
 
     # AMD with ROCm runtime installed → pre-built ROCm binary
     if amd and hw.has_rocm:
@@ -478,12 +536,23 @@ def install_from_asset(
     install_dir: Path,
     progress_cb: ProgressCb | None = None,
 ) -> Path:
+    parts = [asset] + ([asset.runtime] if asset.runtime else [])
+    grand_total = asset.total_bytes
+    done_before = 0
     with tempfile.TemporaryDirectory(prefix="celeste-llama-") as tmp:
-        archive_path = Path(tmp) / asset.name
-        log.info("Downloading %s (%.0f MB)…", asset.name, asset.size_bytes / 1_048_576)
-        _download(asset.download_url, archive_path, progress_cb)
-        log.info("Extracting llama-server…")
-        _extract_server_files(archive_path, install_dir)
+        for part in parts:
+            archive_path = Path(tmp) / part.name
+            log.info("Downloading %s (%.0f MB)…", part.name, part.size_bytes / 1_048_576)
+            offset = done_before
+
+            def part_progress(downloaded: int, total: int, offset: int = offset) -> None:
+                if progress_cb:
+                    progress_cb(offset + downloaded, grand_total or total)
+
+            _download(part.download_url, archive_path, part_progress)
+            done_before += part.size_bytes
+            log.info("Extracting %s…", part.name)
+            _extract_server_files(archive_path, install_dir)
 
     server = install_dir / "llama-server"
     if not server.is_file():
@@ -525,7 +594,8 @@ def compile_llama_server(
 
     with tempfile.TemporaryDirectory(prefix="celeste-llama-build-") as tmp:
         src = Path(tmp) / "llama.cpp"
-        _run(["git", "clone", "--depth", "1", LLAMA_CPP_REPO, str(src)], log_cb)
+        _run(["git", "clone", "--depth", "1", "--branch", LLAMA_CPP_TAG,
+              LLAMA_CPP_REPO, str(src)], log_cb)
 
         build = src / "build"
         cmake_args = [
@@ -609,7 +679,7 @@ def ensure_llama_server(
         tag, assets = fetch_release_assets()
         asset = select_best_asset(assets, hw)
         if asset:
-            size_mb = asset.size_bytes / 1_048_576
+            size_mb = asset.total_bytes / 1_048_576
             log.info("Selected: %s (%.0f MB)", asset.name, size_mb)
             if log_cb:
                 log_cb(f"Downloading {asset.name}  ({size_mb:.0f} MB)…")
