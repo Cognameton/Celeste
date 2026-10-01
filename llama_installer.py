@@ -430,13 +430,14 @@ def _select_cuda_asset(
     assets: list[ReleaseAsset], driver_cuda: tuple[int, int],
 ) -> ReleaseAsset | None:
     """
-    Newest CUDA build the driver can run. Same major version is accepted via
-    CUDA minor-version compatibility (a 13.0 driver runs 13.x builds); an older
-    major also works because drivers are backward compatible.
+    Newest CUDA build no newer than the driver's reported CUDA version.
+    Minor-version compatibility is NOT enough: a 13.4 build crashed on a 13.0
+    driver (GTX 1660, 2026-10-01) with "PTX was compiled with an unsupported
+    toolchain". Older builds are safe because drivers are backward compatible.
     """
     candidates = [
         a for a in assets
-        if a.asset_type == "cuda" and a.cuda_version and a.cuda_version[0] <= driver_cuda[0]
+        if a.asset_type == "cuda" and a.cuda_version and a.cuda_version <= driver_cuda
     ]
     if not candidates:
         return None
